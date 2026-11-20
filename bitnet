@@ -1,0 +1,124 @@
+#!/usr/bin/env bash
+# bitnet — one-stop wrapper for Microsoft BitNet (bitnet.cpp) on the Raspberry Pi.
+#
+#   bitnet setup            install deps, clone, build, download model (idempotent)
+#   bitnet chat             interactive chat in the terminal
+#   bitnet serve [port]     start OpenAI-compatible server + web UI (default 8081, localhost)
+#   bitnet stop             stop the server
+#   bitnet status           show install + server state
+#   bitnet bench            quick tokens/sec benchmark
+#   bitnet update           pull latest BitNet and rebuild
+#
+# Override with env vars: BITNET_HOME, BITNET_MODEL_REPO, BITNET_MODEL_DIR,
+# BITNET_THREADS, BITNET_CTX, BITNET_HOST.
+set -euo pipefail
+
+HOME_DIR="${BITNET_HOME:-$HOME/bitnet-work/BitNet}"
+MODEL_REPO="${BITNET_MODEL_REPO:-microsoft/BitNet-b1.58-2B-4T}"
+MODEL_DIR="${BITNET_MODEL_DIR:-$HOME/storage/models/BitNet-b1.58-2B-4T}"
+MODEL="$MODEL_DIR/ggml-model-i2_s.gguf"
+THREADS="${BITNET_THREADS:-4}"
+CTX="${BITNET_CTX:-4096}"
+HOST="${BITNET_HOST:-127.0.0.1}"
+PIDFILE="${XDG_RUNTIME_DIR:-/tmp}/bitnet-server.pid"
+LOGFILE="$HOME/bitnet-work/server.log"
+REPO_URL="https://github.com/microsoft/BitNet.git"
+
+say() { printf '\033[1;36m==>\033[0m %s\n' "$*"; }
+die() { printf '\033[1;31merror:\033[0m %s\n' "$*" >&2; exit 1; }
+
+need_built() {
+  [[ -x "$HOME_DIR/build/bin/llama-cli" || -x "$HOME_DIR/build/bin/llama-server" ]] \
+    || die "not built yet — run: bitnet setup"
+  [[ -f "$MODEL" ]] || die "model missing at $MODEL — run: bitnet setup"
+}
+
+cmd_setup() {
+  if ! command -v clang >/dev/null; then
+    say "Installing clang (needs sudo)"
+    sudo apt-get install -y clang lld cmake git python3-venv
+  fi
+  if [[ ! -d "$HOME_DIR/.git" ]]; then
+    say "Cloning BitNet"
+    mkdir -p "$(dirname "$HOME_DIR")"
+    git clone --recursive --depth 1 "$REPO_URL" "$HOME_DIR"
+  fi
+  cd "$HOME_DIR"
+  if [[ ! -d .venv ]]; then
+    say "Creating Python venv"
+    python3 -m venv .venv
+    .venv/bin/pip install -q -r requirements.txt "huggingface_hub[cli]"
+  fi
+  if [[ -f "$MODEL" && -x build/bin/llama-cli ]]; then
+    say "Already set up."
+    return
+  fi
+  say "Downloading model and building (this takes a while on 4 cores)"
+  CC=clang CXX=clang++ .venv/bin/python setup_env.py \
+    -hr "$MODEL_REPO" -md "$MODEL_DIR" -q i2_s
+  say "Done. Try: bitnet chat"
+}
+
+cmd_chat() {
+  need_built
+  cd "$HOME_DIR"
+  exec .venv/bin/python run_inference.py -m "$MODEL" -t "$THREADS" -c "$CTX" \
+    -p "You are a helpful assistant." -cnv
+}
+
+server_pid() {
+  [[ -f "$PIDFILE" ]] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && cat "$PIDFILE" || true
+}
+
+cmd_serve() {
+  need_built
+  local port="${1:-8081}"
+  [[ -z "$(server_pid)" ]] || die "already running (pid $(server_pid)); use: bitnet stop"
+  [[ -x "$HOME_DIR/build/bin/llama-server" ]] || die "llama-server not built"
+  mkdir -p "$(dirname "$LOGFILE")"
+  nohup "$HOME_DIR/build/bin/llama-server" -m "$MODEL" --host "$HOST" --port "$port" \
+    -t "$THREADS" -c "$CTX" -ngl 0 --timeout 600 >"$LOGFILE" 2>&1 &
+  echo $! >"$PIDFILE"
+  say "Server started (pid $!) at http://$HOST:$port  — log: $LOGFILE"
+  [[ "$HOST" == "127.0.0.1" ]] && echo "   (localhost only; set BITNET_HOST=0.0.0.0 to expose on the network)"
+}
+
+cmd_stop() {
+  local pid; pid="$(server_pid)"
+  [[ -n "$pid" ]] || { say "Not running."; return; }
+  kill "$pid" && rm -f "$PIDFILE"
+  say "Stopped."
+}
+
+cmd_status() {
+  echo "home:   $HOME_DIR  $([[ -d $HOME_DIR ]] && echo present || echo MISSING)"
+  echo "binary: $([[ -x $HOME_DIR/build/bin/llama-cli ]] && echo built || echo not built)"
+  echo "model:  $([[ -f $MODEL ]] && du -h "$MODEL" | cut -f1 || echo MISSING)  ($MODEL)"
+  echo "server: $([[ -n "$(server_pid)" ]] && echo "running pid $(server_pid)" || echo stopped)"
+}
+
+cmd_bench() {
+  need_built
+  cd "$HOME_DIR"
+  .venv/bin/python run_inference.py -m "$MODEL" -t "$THREADS" -n 128 \
+    -p "Write a short story about a robot learning to garden." 2>&1 \
+    | grep -E 'eval time|total time' || true
+}
+
+cmd_update() {
+  cd "$HOME_DIR"
+  git pull --recurse-submodules
+  rm -rf build
+  CC=clang CXX=clang++ .venv/bin/python setup_env.py -md "$MODEL_DIR" -q i2_s -hr "$MODEL_REPO"
+}
+
+case "${1:-}" in
+  setup)  cmd_setup ;;
+  chat)   cmd_chat ;;
+  serve)  shift; cmd_serve "$@" ;;
+  stop)   cmd_stop ;;
+  status) cmd_status ;;
+  bench)  cmd_bench ;;
+  update) cmd_update ;;
+  *) sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+esac
